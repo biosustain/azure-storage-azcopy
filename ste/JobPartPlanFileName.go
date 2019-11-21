@@ -154,6 +154,7 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 		DestinationRootLength: uint16(len(order.DestinationRoot)),
 		IsFinalPart:           order.IsFinalPart,
 		ForceWrite:            order.ForceWrite,
+		AutoDecompress:        order.AutoDecompress,
 		Priority:              order.Priority,
 		TTLAfterCompletion:    uint32(time.Time{}.Nanosecond()),
 		FromTo:                order.FromTo,
@@ -182,7 +183,9 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 		S2SGetPropertiesInBackend:      order.S2SGetPropertiesInBackend,
 		S2SSourceChangeValidation:      order.S2SSourceChangeValidation,
 		S2SInvalidMetadataHandleOption: order.S2SInvalidMetadataHandleOption,
+		DestLengthValidation:           order.DestLengthValidation,
 		atomicJobStatus:                common.EJobStatus.InProgress(), // We default to InProgress
+		DeleteSnapshotsOption:          order.BlobAttributes.DeleteSnapshotsOption,
 	}
 
 	// Copy any strings into their respective fields
