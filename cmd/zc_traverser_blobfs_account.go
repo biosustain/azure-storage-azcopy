@@ -41,7 +41,7 @@ type BlobFSAccountTraverser struct {
 	cachedFileSystems []string
 
 	// a generic function to notify that a new stored object has been enumerated
-	incrementEnumerationCounter func()
+	incrementEnumerationCounter enumerationCounterFunc
 }
 
 func (t *BlobFSAccountTraverser) isDirectory(isSource bool) bool {
@@ -69,7 +69,7 @@ func (t *BlobFSAccountTraverser) listContainers() ([]string, error) {
 				} else {
 					// realistically this should never ever happen
 					// but on the off-chance that it does, should we panic?
-					LogStdoutAndJobLog("filesystem listing returned nil filesystem name")
+					WarnStdoutAndJobLog("filesystem listing returned nil filesystem name")
 					continue
 				}
 
@@ -112,7 +112,7 @@ func (t *BlobFSAccountTraverser) traverse(preprocessor objectMorpher, processor 
 		err = fileSystemTraverser.traverse(preprocessorForThisChild, processor, filters)
 
 		if err != nil {
-			LogStdoutAndJobLog(fmt.Sprintf("failed to list files in filesystem %s: %s", v, err))
+			WarnStdoutAndJobLog(fmt.Sprintf("failed to list files in filesystem %s: %s", v, err))
 			continue
 		}
 	}
@@ -120,7 +120,7 @@ func (t *BlobFSAccountTraverser) traverse(preprocessor objectMorpher, processor 
 	return nil
 }
 
-func newBlobFSAccountTraverser(rawURL *url.URL, p pipeline.Pipeline, ctx context.Context, incrementEnumerationCounter func()) (t *BlobFSAccountTraverser) {
+func newBlobFSAccountTraverser(rawURL *url.URL, p pipeline.Pipeline, ctx context.Context, incrementEnumerationCounter enumerationCounterFunc) (t *BlobFSAccountTraverser) {
 	bfsURLParts := azbfs.NewBfsURLParts(*rawURL)
 	fsPattern := bfsURLParts.FileSystemName
 

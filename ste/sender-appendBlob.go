@@ -35,7 +35,7 @@ import (
 type appendBlobSenderBase struct {
 	jptm              IJobPartTransferMgr
 	destAppendBlobURL azblob.AppendBlobURL
-	chunkSize         uint32
+	chunkSize         int64
 	numChunks         uint32
 	pacer             pacer
 	// Headers and other info that we will apply to the destination
@@ -57,7 +57,7 @@ func newAppendBlobSenderBase(jptm IJobPartTransferMgr, destination string, p pip
 	chunkSize := transferInfo.BlockSize
 	// If the given chunk Size for the Job is greater than maximum append blob block size i.e 4 MB,
 	// then set chunkSize as 4 MB.
-	chunkSize = common.Iffuint32(
+	chunkSize = common.Iffint64(
 		chunkSize > common.MaxAppendBlobBlockSize,
 		common.MaxAppendBlobBlockSize,
 		chunkSize)
@@ -88,7 +88,11 @@ func newAppendBlobSenderBase(jptm IJobPartTransferMgr, destination string, p pip
 		soleChunkFuncSemaphore: semaphore.NewWeighted(1)}, nil
 }
 
-func (s *appendBlobSenderBase) ChunkSize() uint32 {
+func (s *appendBlobSenderBase) SendableEntityType() common.EntityType {
+	return common.EEntityType.File()
+}
+
+func (s *appendBlobSenderBase) ChunkSize() int64 {
 	return s.chunkSize
 }
 
@@ -96,7 +100,7 @@ func (s *appendBlobSenderBase) NumChunks() uint32 {
 	return s.numChunks
 }
 
-func (s *appendBlobSenderBase) RemoteFileExists() (bool, error) {
+func (s *appendBlobSenderBase) RemoteFileExists() (bool, time.Time, error) {
 	return remoteObjectExists(s.destAppendBlobURL.GetProperties(s.jptm.Context(), azblob.BlobAccessConditions{}))
 }
 
@@ -130,11 +134,9 @@ func (s *appendBlobSenderBase) generateAppendBlockToRemoteFunc(id common.ChunkID
 }
 
 func (s *appendBlobSenderBase) Prologue(ps common.PrologueState) (destinationModified bool) {
-	if ps.CanInferContentType() {
-		// sometimes, specifically when reading local files, we have more info
-		// about the file type at this time than what we had before
-		s.headersToApply.ContentType = ps.GetInferredContentType(s.jptm)
-	}
+	// sometimes, specifically when reading local files, we have more info
+	// about the file type at this time than what we had before
+	s.headersToApply.ContentType = ps.GetInferredContentType(s.jptm)
 
 	destinationModified = true
 	_, err := s.destAppendBlobURL.Create(s.jptm.Context(), s.headersToApply, s.metadataToApply, azblob.BlobAccessConditions{})
@@ -156,7 +158,7 @@ func (s *appendBlobSenderBase) Cleanup() {
 		// There is a possibility that some uncommitted blocks will be there
 		// Delete the uncommitted blobs
 		// TODO: particularly, given that this is an APPEND blob, do we really need to delete it?  But if we don't delete it,
-		//   it will still be in an ambigous situation with regard to how much has been added to it.  Probably best to delete
+		//   it will still be in an ambiguous situation with regard to how much has been added to it.  Probably best to delete
 		//   to be consistent with other
 		deletionContext, cancelFunc := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancelFunc()

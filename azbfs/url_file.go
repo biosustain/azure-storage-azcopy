@@ -53,6 +53,14 @@ func (f FileURL) WithPipeline(p pipeline.Pipeline) FileURL {
 	return NewFileURL(f.fileClient.URL(), p)
 }
 
+func (f FileURL) GetParentDir() (DirectoryURL, error) {
+	d, err := removeLastSectionOfPath(f.URL())
+	if err != nil {
+		return DirectoryURL{}, err
+	}
+	return NewDirectoryURL(d, f.fileClient.p), nil
+}
+
 // Create creates a new file or replaces a file. Note that this method only initializes the file.
 // For more information, see https://docs.microsoft.com/en-us/rest/api/storageservices/create-file.
 func (f FileURL) Create(ctx context.Context, headers BlobFSHTTPHeaders) (*PathCreateResponse, error) {
@@ -89,7 +97,9 @@ func (f FileURL) Download(ctx context.Context, offset int64, count int64) (*Down
 // Body constructs a stream to read data from with a resilient reader option.
 // A zero-value option means to get a raw stream.
 func (dr *DownloadResponse) Body(o RetryReaderOptions) io.ReadCloser {
-	if o.MaxRetryRequests == 0 {
+	// For internal testing, we  check if injectedError is nil.
+	// This allows us to have reader retries
+	if o.MaxRetryRequests == 0 && o.injectedError == nil {
 		return dr.Response().Body
 	}
 
@@ -129,7 +139,7 @@ func (f FileURL) GetProperties(ctx context.Context) (*PathGetPropertiesResponse,
 }
 
 // UploadRange writes bytes to a file.
-// offset indiciates the offset at which to begin writing, in bytes.
+// offset indicates the offset at which to begin writing, in bytes.
 // custom headers are not valid on this operation
 func (f FileURL) AppendData(ctx context.Context, offset int64, body io.ReadSeeker) (*PathUpdateResponse, error) {
 	if offset < 0 {
@@ -148,7 +158,7 @@ func (f FileURL) AppendData(ctx context.Context, offset int64, body io.ReadSeeke
 	//                we should investigate and report the issue
 	// Note: the "offending" code in the Go SDK is: func (t *transferWriter) shouldSendContentLength() bool
 	// That code suggests that a workaround would be to specify a Transfer-Encoding of "identity",
-	// but we haven't yet found any way to actually set that header, so that workaround does't
+	// but we haven't yet found any way to actually set that header, so that workaround doesn't
 	// seem to work. (Just setting Transfer-Encoding like a normal header doesn't seem to work.)
 	// Looks like it might actually be impossible to set
 	// the Transfer-Encoding header, because bradfitz wrote: "as a general rule of thumb, you don't get to mess

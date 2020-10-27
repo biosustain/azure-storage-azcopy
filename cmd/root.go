@@ -23,10 +23,13 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"github.com/Azure/azure-pipeline-go/pipeline"
 	"net/url"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-storage-azcopy/common"
@@ -42,7 +45,15 @@ var azcopyMaxFileAndSocketHandles int
 var outputFormatRaw string
 var cancelFromStdin bool
 var azcopyOutputFormat common.OutputFormat
-var cmdLineCapMegaBitsPerSecond uint32
+var cmdLineCapMegaBitsPerSecond float64
+var azcopyAwaitContinue bool
+var azcopyAwaitAllowOpenFiles bool
+
+// It's not pretty that this one is read directly by credential util.
+// But doing otherwise required us passing it around in many places, even though really
+// it can be thought of as an "ambient" property. That's the (weak?) justification for implementing
+// it as a global
+var cmdLineExtraSuffixesAAD string
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -51,6 +62,13 @@ var rootCmd = &cobra.Command{
 	Short:   rootCmdShortDescription,
 	Long:    rootCmdLongDescription,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+
+		glcm.E2EEnableAwaitAllowOpenFiles(azcopyAwaitAllowOpenFiles)
+		if azcopyAwaitContinue {
+			glcm.E2EAwaitContinue()
+		}
+
+		timeAtPrestart := time.Now()
 
 		err := azcopyOutputFormat.Parse(outputFormatRaw)
 		glcm.SetOutputFormat(azcopyOutputFormat)
@@ -80,15 +98,26 @@ var rootCmd = &cobra.Command{
 
 		// startup of the STE happens here, so that the startup can access the values of command line parameters that are defined for "root" command
 		concurrencySettings := ste.NewConcurrencySettings(azcopyMaxFileAndSocketHandles, preferToAutoTuneGRs)
-		err = ste.MainSTE(concurrencySettings, int64(cmdLineCapMegaBitsPerSecond), azcopyJobPlanFolder, azcopyLogPathFolder, providePerformanceAdvice)
+		err = ste.MainSTE(concurrencySettings, float64(cmdLineCapMegaBitsPerSecond), azcopyJobPlanFolder, azcopyLogPathFolder, providePerformanceAdvice)
 		if err != nil {
 			return err
 		}
+		enumerationParallelism = concurrencySettings.EnumerationPoolSize.Value
+		enumerationParallelStatFiles = concurrencySettings.ParallelStatFiles.Value
+
+		// Log a clear ISO 8601-formatted start time, so it can be read and use in the --include-after parameter
+		// Subtract a few seconds, to ensure that this date DEFINITELY falls before the LMT of any file changed while this
+		// job is running. I.e. using this later with --include-after is _guaranteed_ to pick up all files that changed during
+		// or after this job
+		adjustedTime := timeAtPrestart.Add(-5 * time.Second)
+		startTimeMessage := fmt.Sprintf("ISO 8601 START TIME: to copy files that changed after this job started, use the parameter --%s=%s",
+			common.IncludeAfterFlagName, includeAfterDateFilter{}.FormatAsUTC(adjustedTime))
+		ste.JobsAdmin.LogToJobLog(startTimeMessage, pipeline.LogInfo)
 
 		// spawn a routine to fetch and compare the local application's version against the latest version available
 		// if there's a newer version that can be used, then write the suggestion to stderr
 		// however if this takes too long the message won't get printed
-		// Note: this function is neccessary for non-help, non-login commands, since they don't reach the corresponding
+		// Note: this function is necessary for non-help, non-login commands, since they don't reach the corresponding
 		// beginDetectNewVersion call in Execute (below)
 		beginDetectNewVersion()
 
@@ -98,6 +127,7 @@ var rootCmd = &cobra.Command{
 
 // hold a pointer to the global lifecycle controller so that commands could output messages and exit properly
 var glcm = common.GetLifecycleMgr()
+var glcmSwapOnce = &sync.Once{}
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
@@ -126,14 +156,25 @@ func init() {
 	// replace the word "global" to avoid confusion (e.g. it doesn't affect all instances of AzCopy)
 	rootCmd.SetUsageTemplate(strings.Replace((&cobra.Command{}).UsageTemplate(), "Global Flags", "Flags Applying to All Commands", -1))
 
-	rootCmd.PersistentFlags().Uint32Var(&cmdLineCapMegaBitsPerSecond, "cap-mbps", 0, "Caps the transfer rate, in megabits per second. Moment-by-moment throughput might vary slightly from the cap. If this option is set to zero, or it is omitted, the throughput isn't capped.")
+	rootCmd.PersistentFlags().Float64Var(&cmdLineCapMegaBitsPerSecond, "cap-mbps", 0, "Caps the transfer rate, in megabits per second. Moment-by-moment throughput might vary slightly from the cap. If this option is set to zero, or it is omitted, the throughput isn't capped.")
 	rootCmd.PersistentFlags().StringVar(&outputFormatRaw, "output-type", "text", "Format of the command's output. The choices include: text, json. The default value is 'text'.")
+
+	rootCmd.PersistentFlags().StringVar(&cmdLineExtraSuffixesAAD, trustedSuffixesNameAAD, "", "Specifies additional domain suffixes where Azure Active Directory login tokens may be sent.  The default is '"+
+		trustedSuffixesAAD+"'. Any listed here are added to the default. For security, you should only put Microsoft Azure domains here. Separate multiple entries with semi-colons.")
 
 	// Note: this is due to Windows not supporting signals properly
 	rootCmd.PersistentFlags().BoolVar(&cancelFromStdin, "cancel-from-stdin", false, "Used by partner teams to send in `cancel` through stdin to stop a job.")
 
+	// special E2E testing flags
+	rootCmd.PersistentFlags().BoolVar(&azcopyAwaitContinue, "await-continue", false, "Used when debugging, to tell AzCopy to await `continue` on stdin before starting any work. Assists with debugging AzCopy via attach-to-process")
+	rootCmd.PersistentFlags().BoolVar(&azcopyAwaitAllowOpenFiles, "await-open", false, "Used when debugging, to tell AzCopy to await `open` on stdin, after scanning but before opening the first file. Assists with testing cases around file modifications between scanning and usage")
+
 	// reserved for partner teams
 	rootCmd.PersistentFlags().MarkHidden("cancel-from-stdin")
+
+	// debug-only
+	rootCmd.PersistentFlags().MarkHidden("await-continue")
+	rootCmd.PersistentFlags().MarkHidden("await-open")
 }
 
 // always spins up a new goroutine, because sometimes the aka.ms URL can't be reached (e.g. a constrained environment where

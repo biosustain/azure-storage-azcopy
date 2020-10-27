@@ -45,7 +45,7 @@ type s3ServiceTraverser struct {
 	s3Client *minio.Client
 
 	// a generic function to notify that a new stored object has been enumerated
-	incrementEnumerationCounter func()
+	incrementEnumerationCounter enumerationCounterFunc
 }
 
 func (t *s3ServiceTraverser) isDirectory(isSource bool) bool {
@@ -105,16 +105,16 @@ func (t *s3ServiceTraverser) traverse(preprocessor objectMorpher, processor obje
 
 		if err != nil {
 			if strings.Contains(err.Error(), "301 response missing Location header") {
-				LogStdoutAndJobLog(fmt.Sprintf("skip enumerating the bucket %q , as it's not in the region specified by source URL", v))
+				WarnStdoutAndJobLog(fmt.Sprintf("skip enumerating the bucket %q , as it's not in the region specified by source URL", v))
 				continue
 			}
 
 			if strings.Contains(err.Error(), "cannot list objects, The specified bucket does not exist") {
-				LogStdoutAndJobLog(fmt.Sprintf("skip enumerating the bucket %q, as it does not exist.", v))
+				WarnStdoutAndJobLog(fmt.Sprintf("skip enumerating the bucket %q, as it does not exist.", v))
 				continue
 			}
 
-			LogStdoutAndJobLog(fmt.Sprintf("failed to list objects in bucket %s: %s", v, err))
+			WarnStdoutAndJobLog(fmt.Sprintf("failed to list objects in bucket %s: %s", v, err))
 			continue
 		}
 	}
@@ -122,7 +122,7 @@ func (t *s3ServiceTraverser) traverse(preprocessor objectMorpher, processor obje
 	return nil
 }
 
-func newS3ServiceTraverser(rawURL *url.URL, ctx context.Context, getProperties bool, incrementEnumerationCounter func()) (t *s3ServiceTraverser, err error) {
+func newS3ServiceTraverser(rawURL *url.URL, ctx context.Context, getProperties bool, incrementEnumerationCounter enumerationCounterFunc) (t *s3ServiceTraverser, err error) {
 	t = &s3ServiceTraverser{ctx: ctx, incrementEnumerationCounter: incrementEnumerationCounter, getProperties: getProperties}
 
 	var s3URLParts common.S3URLParts

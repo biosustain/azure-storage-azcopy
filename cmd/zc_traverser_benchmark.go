@@ -28,23 +28,37 @@ import (
 type benchmarkTraverser struct {
 	fileCount                   uint
 	bytesPerFile                int64
-	incrementEnumerationCounter func()
+	numOfFolders                uint
+	incrementEnumerationCounter enumerationCounterFunc
 }
 
-func newBenchmarkTraverser(source string, incrementEnumerationCounter func()) (*benchmarkTraverser, error) {
-	fc, bpf, err := benchmarkSourceHelper{}.FromUrl(source)
+func newBenchmarkTraverser(source string, incrementEnumerationCounter enumerationCounterFunc) (*benchmarkTraverser, error) {
+	fc, bpf, nf, err := benchmarkSourceHelper{}.FromUrl(source)
 	if err != nil {
 		return nil, err
 	}
 	return &benchmarkTraverser{
 			fileCount:                   fc,
 			bytesPerFile:                bpf,
+			numOfFolders:                nf,
 			incrementEnumerationCounter: incrementEnumerationCounter},
 		nil
 }
 
 func (t *benchmarkTraverser) isDirectory(bool) bool {
 	return true
+}
+
+func (_ *benchmarkTraverser) toReversedString(i uint) string {
+	s := fmt.Sprintf("%d", i)
+	count := len(s)
+	b := []byte(s)
+	r := make([]byte, count)
+	lastIndex := count - 1
+	for n, x := range b {
+		r[lastIndex-n] = x
+	}
+	return string(r)
 }
 
 func (t *benchmarkTraverser) traverse(preprocessor objectMorpher, processor objectProcessor, filters []objectFilter) (err error) {
@@ -54,22 +68,30 @@ func (t *benchmarkTraverser) traverse(preprocessor objectMorpher, processor obje
 
 	for i := uint(1); i <= t.fileCount; i++ {
 
-		name := fmt.Sprintf("%d", i)
+		name := t.toReversedString(i) // this gives an even distribution through the namespace (compare the starting characters, for 0 to 199, when reversed or not). This is useful for performance when High Throughput Block Blob pathway does not apply
 		relativePath := name
 
+		if t.numOfFolders > 0 {
+			assignedFolder := t.toReversedString(i % t.numOfFolders)
+			relativePath = assignedFolder + common.AZCOPY_PATH_SEPARATOR_STRING + relativePath
+		}
+
 		if t.incrementEnumerationCounter != nil {
-			t.incrementEnumerationCounter()
+			t.incrementEnumerationCounter(common.EEntityType.File())
 		}
 
 		err = processIfPassedFilters(filters, newStoredObject(
 			preprocessor,
 			name,
 			relativePath,
+			common.EEntityType.File(),
 			common.BenchmarkLmt,
 			t.bytesPerFile,
-			nil,
-			blobTypeNA,
+			noContentProps,
+			noBlobProps,
+			noMetdata,
 			""), processor)
+		_, err = getProcessingError(err)
 		if err != nil {
 			return err
 		}

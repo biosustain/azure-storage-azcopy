@@ -20,6 +20,8 @@ var lcm = func() (lcmgr *lifecycleMgr) {
 		msgQueue:             make(chan outputMessage, 1000),
 		progressCache:        "",
 		cancelChannel:        make(chan os.Signal, 1),
+		e2eContinueChannel:   make(chan struct{}),
+		e2eAllowOpenChannel:  make(chan struct{}),
 		outputFormat:         EOutputFormat.Text(), // output text by default
 		logSanitizer:         NewAzCopyLogSanitizer(),
 		inputQueue:           make(chan userInput, 1000),
@@ -57,6 +59,9 @@ type LifecycleMgr interface {
 	EnableInputWatcher()                                         // depending on the command, we may allow user to give input through Stdin
 	EnableCancelFromStdIn()                                      // allow user to send in `cancel` to stop the job
 	AddUserAgentPrefix(string) string                            // append the global user agent prefix, if applicable
+	E2EAwaitContinue()                                           // used by E2E tests
+	E2EAwaitAllowOpenFiles()                                     // used by E2E tests
+	E2EEnableAwaitAllowOpenFiles(enable bool)                    // used by E2E tests
 }
 
 func GetLifecycleMgr() LifecycleMgr {
@@ -65,15 +70,19 @@ func GetLifecycleMgr() LifecycleMgr {
 
 // single point of control for all outputs
 type lifecycleMgr struct {
-	msgQueue             chan outputMessage
-	progressCache        string // useful for keeping job progress on the last line
-	cancelChannel        chan os.Signal
-	waitEverCalled       int32
-	outputFormat         OutputFormat
-	logSanitizer         pipeline.LogSanitizer
-	inputQueue           chan userInput // msgs from the user
-	allowWatchInput      bool           // accept user inputs and place then in the inputQueue
-	allowCancelFromStdIn bool           // allow user to send in 'cancel' from the stdin to stop the current job
+	msgQueue              chan outputMessage
+	progressCache         string // useful for keeping job progress on the last line
+	cancelChannel         chan os.Signal
+	e2eContinueChannel    chan struct{}
+	e2eAllowOpenChannel   chan struct{}
+	waitEverCalled        int32
+	outputFormat          OutputFormat
+	logSanitizer          pipeline.LogSanitizer
+	inputQueue            chan userInput // msgs from the user
+	allowWatchInput       bool           // accept user inputs and place then in the inputQueue
+	allowCancelFromStdIn  bool           // allow user to send in 'cancel' from the stdin to stop the current job
+	e2eAllowAwaitContinue bool           // allow the user to send 'continue' from stdin to start the current job
+	e2eAllowAwaitOpen     bool           // allow the user to send 'open' from stdin to allow the opening of the first file
 }
 
 type userInput struct {
@@ -103,6 +112,10 @@ func (lcm *lifecycleMgr) watchInputs() {
 
 		if lcm.allowCancelFromStdIn && strings.EqualFold(msg, "cancel") {
 			lcm.cancelChannel <- os.Interrupt
+		} else if lcm.e2eAllowAwaitContinue && strings.EqualFold(msg, "continue") {
+			close(lcm.e2eContinueChannel)
+		} else if lcm.e2eAllowAwaitOpen && strings.EqualFold(msg, "open") {
+			close(lcm.e2eAllowOpenChannel)
 		} else {
 			lcm.inputQueue <- userInput{timeReceived: timeReceived, content: msg}
 		}
@@ -422,8 +435,8 @@ func (lcm *lifecycleMgr) processTextOutput(msgToOutput outputMessage) {
 
 // for the lifecycleMgr to babysit a job, it must be given a controller to get information about the job
 type WorkController interface {
-	Cancel(mgr LifecycleMgr)               // handle to cancel the work
-	ReportProgressOrExit(mgr LifecycleMgr) // print the progress status, optionally exit the application if work is done
+	Cancel(mgr LifecycleMgr)                                        // handle to cancel the work
+	ReportProgressOrExit(mgr LifecycleMgr) (totalKnownCount uint32) // print the progress status, optionally exit the application if work is done
 }
 
 // AllowReinitiateProgressReporting must be called before running an cleanup job, to allow the initiation of that job's
@@ -441,20 +454,47 @@ func (lcm *lifecycleMgr) InitiateProgressReporting(jc WorkController) {
 	// this go routine never returns
 	// it will terminate the whole process eventually when the work is complete
 	go func() {
+		const progressFrequencyThreshold = 1000000
+		var oldCount, newCount uint32
+
 		// cancelChannel will be notified when os receives os.Interrupt and os.Kill signals
 		signal.Notify(lcm.cancelChannel, os.Interrupt, os.Kill)
+
+		cancelCalled := false
+
+		doCancel := func() {
+			cancelCalled = true
+			lcm.Info("Cancellation requested. Beginning clean shutdown...")
+			jc.Cancel(lcm)
+		}
 
 		for {
 			select {
 			case <-lcm.cancelChannel:
-				lcm.Info("Cancellation requested. Beginning clean shutdown...")
-				jc.Cancel(lcm)
+				doCancel()
+				continue // to exit on next pass through loop
 			default:
-				jc.ReportProgressOrExit(lcm)
+				newCount = jc.ReportProgressOrExit(lcm)
+			}
+
+			wait := 2 * time.Second
+			if newCount >= progressFrequencyThreshold && !cancelCalled {
+				// report less on progress  - to save on the CPU costs of doing so and because, if there are this many files,
+				// its going to be a long job anyway, so no need to report so often
+				wait = 2 * time.Minute
+				if oldCount < progressFrequencyThreshold {
+					lcm.Info(fmt.Sprintf("Reducing progress output frequency to %v, because there are over %d files", wait, progressFrequencyThreshold))
+				}
 			}
 
 			// wait a bit before fetching job status again, as fetching has costs associated with it on the backend
-			time.Sleep(2 * time.Second)
+			select {
+			case <-lcm.cancelChannel:
+				doCancel()
+			case <-time.After(wait):
+			}
+
+			oldCount = newCount
 		}
 	}()
 }
@@ -474,6 +514,37 @@ func (lcm *lifecycleMgr) AddUserAgentPrefix(userAgent string) string {
 	}
 
 	return userAgent
+}
+
+func (_ *lifecycleMgr) awaitChannel(ch chan struct{}, timeout time.Duration) {
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+	}
+}
+
+// E2EAwaitContinue is used in case where a developer want's to debug AzCopy by attaching to the running process,
+// before it starts doing any actual work.
+func (lcm *lifecycleMgr) E2EAwaitContinue() {
+	lcm.e2eAllowAwaitContinue = true // not technically gorountine safe (since its shared state) but its consistent with EnableInputWatcher
+	lcm.EnableInputWatcher()
+	lcm.awaitChannel(lcm.e2eContinueChannel, time.Minute)
+}
+
+// E2EAwaitAllowOpenFiles is used in cases where we want to artificially produce a pause between enumeration and sending
+// of the first file, for test purposes. (It only achieves that effect when the total file count is <= size of one job part).
+// Does not pause at all, unless the feature has been enabled with a command-line flag.
+func (lcm *lifecycleMgr) E2EAwaitAllowOpenFiles() {
+	lcm.awaitChannel(lcm.e2eAllowOpenChannel, 5*time.Minute)
+}
+
+func (lcm *lifecycleMgr) E2EEnableAwaitAllowOpenFiles(enable bool) {
+	if enable {
+		lcm.e2eAllowAwaitOpen = true // not technically gorountine safe (since its shared state) but its consistent with EnableInputWatcher
+		lcm.EnableInputWatcher()
+	} else {
+		close(lcm.e2eAllowOpenChannel) // so that E2EAwaitAllowOpenFiles will instantly return every time
+	}
 }
 
 // captures the common logic of exiting if there's an expected error

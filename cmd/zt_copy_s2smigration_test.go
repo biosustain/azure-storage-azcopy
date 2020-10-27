@@ -83,6 +83,7 @@ func getDefaultRawCopyInput(src, dst string) rawCopyCmdArgs {
 		s2sSourceChangeValidation:      defaultS2SSourceChangeValidation,
 		s2sInvalidMetadataHandleOption: defaultS2SInvalideMetadataHandleOption.String(),
 		forceWrite:                     common.EOverwriteOption.True().String(),
+		preserveOwner:                  common.PreserveOwnerDefault,
 	}
 }
 
@@ -113,6 +114,11 @@ func validateS2STransfersAreScheduled(c *chk.C, srcDirName string, dstDirName st
 
 		srcRelativeFilePath = strings.Replace(srcRelativeFilePath, unescapedSrcDir, "", 1)
 		dstRelativeFilePath = strings.Replace(dstRelativeFilePath, unescapedDstDir, "", 1)
+		if unescapedDstDir == dstRelativeFilePath+"/" {
+			// Thing we were searching for is bigger than what we are searching in, due to ending end a /
+			// Happens for root dir
+			dstRelativeFilePath = ""
+		}
 
 		if debugMode {
 			fmt.Println("srcRelativeFilePath: ", srcRelativeFilePath)
@@ -276,7 +282,16 @@ func (s *cmdIntegrationSuite) TestS2SCopyFromS3ToBlobWithBucketNameNeedBeResolve
 	runCopyAndVerify(c, raw, func(err error) {
 		c.Assert(err, chk.NotNil)
 
-		loggedError := glcm.(*mockedLifecycleManager).logContainsText("invalid name", time.Second)
+		loggedError := false
+		log := glcm.(*mockedLifecycleManager).infoLog
+		count := len(log)
+		for count > 0 {
+			x := <-log
+			if strings.Contains(x, "invalid name") {
+				loggedError = true
+			}
+			count = len(log)
+		}
 
 		c.Assert(loggedError, chk.Equals, true)
 	})
@@ -622,6 +637,7 @@ func (s *cmdIntegrationSuite) TestS2SCopyFromContainerToContainerNoPreserveBlobT
 
 //Attempt to copy from a page blob to a block blob
 func (s *cmdIntegrationSuite) TestS2SCopyFromPageToBlockBlob(c *chk.C) {
+	c.Skip("Enable after setting Account to non-HNS")
 	bsu := getBSU()
 
 	// Generate source container and blobs
@@ -778,6 +794,7 @@ func (s *cmdIntegrationSuite) TestS2SCopyFromBlockToAppendBlob(c *chk.C) {
 
 //Attempt to copy from an append blob to a block blob
 func (s *cmdIntegrationSuite) TestS2SCopyFromAppendToBlockBlob(c *chk.C) {
+	c.Skip("Enable after setting Account to non-HNS")
 	bsu := getBSU()
 
 	// Generate source container and blobs
@@ -830,6 +847,7 @@ func (s *cmdIntegrationSuite) TestS2SCopyFromAppendToBlockBlob(c *chk.C) {
 
 //Attempt to copy from a page blob to an append blob
 func (s *cmdIntegrationSuite) TestS2SCopyFromPageToAppendBlob(c *chk.C) {
+	c.Skip("Enable after setting Account to non-HNS")
 	bsu := getBSU()
 
 	// Generate source container and blobs
@@ -882,6 +900,7 @@ func (s *cmdIntegrationSuite) TestS2SCopyFromPageToAppendBlob(c *chk.C) {
 
 //Attempt to copy from an append blob to a page blob
 func (s *cmdIntegrationSuite) TestS2SCopyFromAppendToPageBlob(c *chk.C) {
+	c.Skip("Enable after setting Account to non-HNS")
 	bsu := getBSU()
 
 	// Generate source container and blobs

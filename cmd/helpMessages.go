@@ -59,7 +59,11 @@ Upload a single file by using a SAS token:
 
 Upload a single file by using a SAS token and piping (block blobs only):
   
-  - cat "/path/to/file.txt" | azcopy cp "https://[account].blob.core.windows.net/[container]/[path/to/blob]?[SAS]"
+  - cat "/path/to/file.txt" | azcopy cp "https://[account].blob.core.windows.net/[container]/[path/to/blob]?[SAS]" --from-to PipeBlob
+
+Upload a single file by using OAuth and piping (block blobs only):
+
+  - cat "/path/to/file.txt" | azcopy cp "https://[account].blob.core.windows.net/[container]/[path/to/blob]" --from-to PipeBlob
 
 Upload an entire directory by using a SAS token:
   
@@ -85,7 +89,11 @@ Download a single file by using a SAS token:
 
 Download a single file by using a SAS token and then piping the output to a file (block blobs only):
   
-  - azcopy cp "https://[account].blob.core.windows.net/[container]/[path/to/blob]?[SAS]" > "/path/to/file.txt"
+  - azcopy cp "https://[account].blob.core.windows.net/[container]/[path/to/blob]?[SAS]" --from-to BlobPipe > "/path/to/file.txt"
+
+Download a single file by using OAuth and then piping the output to a file (block blobs only):
+  
+  - azcopy cp "https://[account].blob.core.windows.net/[container]/[path/to/blob]" --from-to BlobPipe > "/path/to/file.txt"
 
 Download an entire directory by using a SAS token:
   
@@ -108,6 +116,10 @@ Download an entire storage account.
 Download a subset of containers within a storage account by using a wildcard symbol (*) in the container name.
 
   - azcopy cp "https://[srcaccount].blob.core.windows.net/[container*name]" "/path/to/dir" --recursive
+
+Download all the versions of a blob from Azure Storage to local directory. Ensure that source is a valid blob, destination is a local folder and versionidsFile which takes in a path to the file where each version is written on a separate line. All the specified versions will get downloaded in the destination folder specified.
+
+  - azcopy cp "https://[srcaccount].blob.core.windows.net/[containername]/[blobname]" "/path/to/dir" --list-of-versions="/another/path/to/dir/[versionidsFile]"
 
 Copy a single blob to another blob by using a SAS token.
 
@@ -241,12 +253,12 @@ Log in by using the user-assigned identity of a VM and a Resource ID of the serv
 Log in as a service principal by using a client secret:
 Set the environment variable AZCOPY_SPA_CLIENT_SECRET to the client secret for secret based service principal auth.
 
-   - azcopy login --service-principal
+   - azcopy login --service-principal --application-id <your service principal's application ID>
 
 Log in as a service principal by using a certificate and it's password:
 Set the environment variable AZCOPY_SPA_CERT_PASSWORD to the certificate's password for cert based service principal auth
 
-   - azcopy login --service-principal --certificate-path /path/to/my/cert
+   - azcopy login --service-principal --certificate-path /path/to/my/cert --application-id <your service principal's application ID>
 
    Please treat /path/to/my/cert as a path to a PEM or PKCS12 file-- AzCopy does not reach into the system cert store to obtain your certificate.
    --certificate-path is mandatory when doing cert-based service principal auth.
@@ -286,11 +298,15 @@ Remove only the blobs inside of a virtual directory, but don't remove any subdir
 
 Remove a subset of blobs in a virtual directory (For example: remove only jpg and pdf files, or if the blob name is "exactName"):
 
-   - azcopy rm "https://[account].blob.core.windows.net/[container]/[path/to/directory]?[SAS]" --recursive=true --include="*.jpg;*.pdf;exactName"
+   - azcopy rm "https://[account].blob.core.windows.net/[container]/[path/to/directory]?[SAS]" --recursive=true --include-pattern="*.jpg;*.pdf;exactName"
 
 Remove an entire virtual directory but exclude certain blobs from the scope (For example: every blob that starts with foo or ends with bar):
 
-   - azcopy rm "https://[account].blob.core.windows.net/[container]/[path/to/directory]?[SAS]" --recursive=true --exclude="foo*;*bar"
+   - azcopy rm "https://[account].blob.core.windows.net/[container]/[path/to/directory]?[SAS]" --recursive=true --exclude-pattern="foo*;*bar"
+
+Remove specified version ids of a blob from Azure Storage. Ensure that source is a valid blob and versionidsfile which takes in a path to the file where each version is written on a separate line. All the specified versions will be removed from Azure Storage.
+
+  - azcopy rm "https://[srcaccount].blob.core.windows.net/[containername]/[blobname]" "/path/to/dir" --list-of-versions="/path/to/dir/[versionidsfile]"
 
 Remove specific blobs and virtual directories by putting their relative paths (NOT URL-encoded) in a file:
 
@@ -336,6 +352,9 @@ The built-in lookup table is small but on Unix it is augmented by the local syst
   - /etc/apache/mime.types
 
 On Windows, MIME types are extracted from the registry.
+
+Please also note that sync works off of the last modified times exclusively. So in the case of Azure File <-> Azure File,
+the header field Last-Modified is used instead of x-ms-file-change-time, which means that metadata changes at the source can also trigger a full copy.
 `
 
 const syncCmdExample = `
@@ -359,11 +378,11 @@ Sync only the files inside of a directory but not subdirectories or the files in
 
 Sync a subset of files in a directory (For example: only jpg and pdf files, or if the file name is "exactName"):
 
-   - azcopy sync "/path/to/dir" "https://[account].blob.core.windows.net/[container]/[path/to/virtual/dir]" --include="*.jpg;*.pdf;exactName"
+   - azcopy sync "/path/to/dir" "https://[account].blob.core.windows.net/[container]/[path/to/virtual/dir]" --include-pattern="*.jpg;*.pdf;exactName"
 
 Sync an entire directory but exclude certain files from the scope (For example: every file that starts with foo or ends with bar):
 
-   - azcopy sync "/path/to/dir" "https://[account].blob.core.windows.net/[container]/[path/to/virtual/dir]" --exclude="foo*;*bar"
+   - azcopy sync "/path/to/dir" "https://[account].blob.core.windows.net/[container]/[path/to/virtual/dir]" --exclude-pattern="foo*;*bar"
 
 Sync a single blob:
 
@@ -399,30 +418,41 @@ const benchCmdShortDescription = "Performs a performance benchmark"
 // TODO: document whether we delete the uploaded data
 
 const benchCmdLongDescription = `
-Runs a performance benchmark by uploading test data to a specified destination. The test data is automatically generated.
+Runs a performance benchmark by uploading or downloading test data to or from a specified destination. 
+For uploads, the test data is automatically generated.
 
-The benchmark command runs the same upload process as 'copy', except that: 
+The benchmark command runs the same process as 'copy', except that: 
 
-  - There's no source parameter.  The command requires only a destination URL. In the current release, this destination URL must refer to a blob container.
-  
-  - The payload is described by command line parameters, which control how many files are auto-generated and 
+  - Instead of requiring both source and destination parameters, benchmark takes just one. This is the 
+    blob container, Azure Files Share, or ADLS Gen 2 File System that you want to upload to or download from.
+
+  - The 'mode' parameter describes whether AzCopy should test uploads to or downloads from given target. Valid values are 'Upload'
+    and 'Download'. Default value is 'Upload'.
+
+  - For upload benchmarks, the payload is described by command line parameters, which control how many files are auto-generated and 
     how big they are. The generation process takes place entirely in memory. Disk is not used.
+
+  - For downloads, the payload consists of whichever files already exist at the source. (See example below about how to generate
+    test files if needed).
   
   - Only a few of the optional parameters that are available to the copy command are supported.
   
   - Additional diagnostics are measured and reported.
   
-  - By default, the transferred data is deleted at the end of the test run.
+  - For uploads, the default behaviour is to delete the transferred data at the end of the test run.  For downloads, the data
+    is never actually saved locally.
 
 Benchmark mode will automatically tune itself to the number of parallel TCP connections that gives 
 the maximum throughput. It will display that number at the end. To prevent auto-tuning, set the 
 AZCOPY_CONCURRENCY_VALUE environment variable to a specific number of connections. 
 
-All the usual authentication types are supported. However, the most convenient approach for benchmarking is typically
-to create an empty container with a SAS token and use SAS authentication.
+All the usual authentication types are supported. However, the most convenient approach for benchmarking upload is typically
+to create an empty container with a SAS token and use SAS authentication. (Download mode requires a set of test data to be
+present in the target container.)
+  
 `
 
-const benchCmdExample = `Run a benchmark test with default parameters (suitable for benchmarking networks up to 1 Gbps):'
+const benchCmdExample = `Run an upload benchmark with default parameters (suitable for benchmarking networks up to 1 Gbps):'
 
    - azcopy bench "https://[account].blob.core.windows.net/[container]?<SAS>"
 
@@ -434,5 +464,13 @@ Same as above, but use 50,000 files, each 8 MiB in size and compute their MD5 ha
 in the copy command). The purpose of --put-md5 when benchmarking is to test whether MD5 computation affects throughput for the 
 selected file count and size:
 
-   - azcopy bench "https://[account].blob.core.windows.net/[container]?<SAS>" --file-count 50000 --size-per-file 8M --put-md5
+   - azcopy bench --mode='Upload' "https://[account].blob.core.windows.net/[container]?<SAS>" --file-count 50000 --size-per-file 8M --put-md5
+
+Run a benchmark test that downloads existing files from a target
+
+   - azcopy bench --mode='Download' "https://[account].blob.core.windows.net/[container]?<SAS?"
+
+Run an upload that does not delete the transferred files. (These files can then serve as the payload for a download test)
+
+   - azcopy bench "https://[account].blob.core.windows.net/[container]?<SAS>" --file-count 100 --delete-test-data=false
 `

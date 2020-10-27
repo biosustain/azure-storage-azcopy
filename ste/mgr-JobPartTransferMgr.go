@@ -20,9 +20,7 @@ import (
 type IJobPartTransferMgr interface {
 	FromTo() common.FromTo
 	Info() TransferInfo
-	BlobDstData(dataFileToXfer []byte) (headers azblob.BlobHTTPHeaders, metadata azblob.Metadata)
-	FileDstData(dataFileToXfer []byte) (headers azfile.FileHTTPHeaders, metadata azfile.Metadata)
-	BfsDstData(dataFileToXfer []byte) (headers azbfs.BlobFSHTTPHeaders)
+	ResourceDstData(dataFileToXfer []byte) (headers common.ResourceHTTPHeaders, metadata common.Metadata)
 	LastModifiedTime() time.Time
 	PreserveLastModifiedTime() (time.Time, bool)
 	ShouldPutMd5() bool
@@ -35,10 +33,11 @@ type IJobPartTransferMgr interface {
 	SlicePool() common.ByteSlicePooler
 	CacheLimiter() common.CacheLimiter
 	WaitUntilLockDestination(ctx context.Context) error
-	UnlockDestination()
+	EnsureDestinationUnlocked()
 	HoldsDestinationLock() bool
 	StartJobXfer()
 	GetOverwriteOption() common.OverwriteOption
+	GetForceIfReadOnly() bool
 	ShouldDecompress() bool
 	GetSourceCompressionType() (common.CompressionType, error)
 	ReportChunkDone(id common.ChunkID) (lastChunk bool, chunksDone uint32)
@@ -81,15 +80,22 @@ type IJobPartTransferMgr interface {
 	ChunkStatusLogger() common.ChunkStatusLogger
 	LogAtLevelForCurrentTransfer(level pipeline.LogLevel, msg string)
 	GetOverwritePrompter() *overwritePrompter
+	GetFolderCreationTracker() common.FolderCreationTracker
 	common.ILogger
 	DeleteSnapshotsOption() common.DeleteSnapshotsOption
+	SecurityInfoPersistenceManager() *securityInfoPersistenceManager
+	FolderDeletionManager() common.FolderDeletionManager
+	GetDestinationRoot() string
 }
 
 type TransferInfo struct {
-	BlockSize   uint32
-	Source      string
-	SourceSize  int64
-	Destination string
+	BlockSize              int64
+	Source                 string
+	SourceSize             int64
+	Destination            string
+	EntityType             common.EntityType
+	PreserveSMBPermissions common.PreservePermissionsOption
+	PreserveSMBInfo        bool
 
 	// Transfer info for S2S copy
 	SrcProperties
@@ -105,6 +111,35 @@ type TransferInfo struct {
 	// NumChunks is the number of chunks in which transfer will be split into while uploading the transfer.
 	// NumChunks is not used in case of AppendBlob transfer.
 	NumChunks uint16
+}
+
+func (i TransferInfo) IsFolderPropertiesTransfer() bool {
+	return i.EntityType == common.EEntityType.Folder()
+}
+
+// We don't preserve LMTs on folders.
+// The main reason is that preserving folder LMTs at download time is very difficult, because it requires us to keep track of when the
+// last file has been saved in each folder OR just do all the folders at the very end.
+// This is because if we modify the contents of a folder after setting its LMT, then the LMT will change because Windows and Linux
+//(and presumably MacOS) automatically update the folder LMT when the contents are changed.
+// The possible solutions to this problem may become difficult on very large jobs (e.g. 10s or hundreds of millions of files,
+// with millions of directories).
+// The secondary reason is that folder LMT's don't actually tell the user anything particularly useful. Specifically,
+// they do NOT tell you when the folder contents (recursively) were last updated: in Azure Files they are never updated
+// when folder contents change; and in NTFS they are only updated when immediate children are changed (not grandchildren).
+func (i TransferInfo) ShouldTransferLastWriteTime() bool {
+	return !i.IsFolderPropertiesTransfer()
+}
+
+// entityTypeLogIndicator returns a string that can be used in logging to distinguish folder property transfers from "normal" transfers.
+// It's purpose is to avoid any confusion from folks seeing a folder name in the log and thinking, "But I don't have a file with that name".
+// It also makes it clear that the log record relates to the folder's properties, not its contained files.
+func (i TransferInfo) entityTypeLogIndicator() string {
+	if i.IsFolderPropertiesTransfer() {
+		return "(folder properties) "
+	} else {
+		return ""
+	}
 }
 
 type SrcProperties struct {
@@ -148,6 +183,8 @@ type jobPartTransferMgr struct {
 
 	numChunks uint32
 
+	transferInfo *TransferInfo
+
 	actionAfterLastChunk func()
 
 	/*
@@ -160,6 +197,10 @@ func (jptm *jobPartTransferMgr) GetOverwritePrompter() *overwritePrompter {
 	return jptm.jobPartMgr.getOverwritePrompter()
 }
 
+func (jptm *jobPartTransferMgr) GetFolderCreationTracker() common.FolderCreationTracker {
+	return jptm.jobPartMgr.getFolderCreationTracker()
+}
+
 func (jptm *jobPartTransferMgr) FromTo() common.FromTo {
 	return jptm.jobPartMgr.Plan().FromTo
 }
@@ -170,6 +211,10 @@ func (jptm *jobPartTransferMgr) StartJobXfer() {
 
 func (jptm *jobPartTransferMgr) GetOverwriteOption() common.OverwriteOption {
 	return jptm.jobPartMgr.GetOverwriteOption()
+}
+
+func (jptm *jobPartTransferMgr) GetForceIfReadOnly() bool {
+	return jptm.jobPartMgr.GetForceIfReadOnly()
 }
 
 func (jptm *jobPartTransferMgr) ShouldDecompress() bool {
@@ -186,11 +231,15 @@ func (jptm *jobPartTransferMgr) GetSourceCompressionType() (common.CompressionTy
 }
 
 func (jptm *jobPartTransferMgr) Info() TransferInfo {
+	if jptm.transferInfo != nil {
+		return *jptm.transferInfo
+	}
+
 	plan := jptm.jobPartMgr.Plan()
-	src, dst := plan.TransferSrcDstStrings(jptm.transferIndex)
+	src, dst, _ := plan.TransferSrcDstStrings(jptm.transferIndex)
 	dstBlobData := plan.DstBlobData
 
-	srcHTTPHeaders, srcMetadata, srcBlobType, srcBlobTier, s2sGetPropertiesInBackend, DestLengthValidation, s2sSourceChangeValidation, s2sInvalidMetadataHandleOption :=
+	srcHTTPHeaders, srcMetadata, srcBlobType, srcBlobTier, s2sGetPropertiesInBackend, DestLengthValidation, s2sSourceChangeValidation, s2sInvalidMetadataHandleOption, entityType, versionID :=
 		plan.TransferSrcPropertiesAndMetadata(jptm.transferIndex)
 	srcSAS, dstSAS := jptm.jobPartMgr.SAS()
 	// If the length of destination SAS is greater than 0
@@ -229,23 +278,49 @@ func (jptm *jobPartTransferMgr) Info() TransferInfo {
 		src = sUrl.String()
 	}
 
+	if versionID != "" {
+		versionID = "versionId=" + versionID
+		sURL, e := url.Parse(src)
+		if e != nil {
+			panic(e)
+		}
+		if len(sURL.RawQuery) > 0 {
+			sURL.RawQuery += "&" + versionID
+		} else {
+			sURL.RawQuery = versionID
+		}
+		src = sURL.String()
+	}
+
 	sourceSize := plan.Transfer(jptm.transferIndex).SourceSize
 	var blockSize = dstBlobData.BlockSize
 	// If the blockSize is 0, then User didn't provide any blockSize
 	// We need to set the blockSize in such way that number of blocks per blob
 	// does not exceeds 50000 (max number of block per blob)
 	if blockSize == 0 {
-		blockSize = uint32(common.DefaultBlockBlobBlockSize)
-		for ; uint32(sourceSize/int64(blockSize)) > common.MaxNumberOfBlocksPerBlob; blockSize = 2 * blockSize {
+		blockSize = common.DefaultBlockBlobBlockSize
+		for ; uint32(sourceSize/blockSize) > common.MaxNumberOfBlocksPerBlob; blockSize = 2 * blockSize {
+			if blockSize > common.BlockSizeThreshold {
+				/*
+				 * For a RAM usage of 0.5G/core, we would have 4G memory on typical 8 core device, meaning at a blockSize of 256M,
+				 * we can have 4 blocks in core, waiting for a disk or n/w operation. Any higher block size would *sort of*
+				 * serialize n/w and disk operations, and is better avoided.
+				 */
+				blockSize = sourceSize / common.MaxNumberOfBlocksPerBlob
+				break
+			}
 		}
 	}
-	blockSize = common.Iffuint32(blockSize > common.MaxBlockBlobBlockSize, common.MaxBlockBlobBlockSize, blockSize)
+	blockSize = common.Iffint64(blockSize > common.MaxBlockBlobBlockSize, common.MaxBlockBlobBlockSize, blockSize)
 
-	return TransferInfo{
+	jptm.transferInfo = &TransferInfo{
 		BlockSize:                      blockSize,
 		Source:                         src,
 		SourceSize:                     sourceSize,
 		Destination:                    dst,
+		EntityType:                     entityType,
+		PreserveSMBPermissions:         plan.PreserveSMBPermissions,
+		PreserveSMBInfo:                plan.PreserveSMBInfo,
 		S2SGetPropertiesInBackend:      s2sGetPropertiesInBackend,
 		S2SSourceChangeValidation:      s2sSourceChangeValidation,
 		S2SInvalidMetadataHandleOption: s2sInvalidMetadataHandleOption,
@@ -257,6 +332,8 @@ func (jptm *jobPartTransferMgr) Info() TransferInfo {
 		SrcBlobType:    srcBlobType,
 		S2SSrcBlobTier: srcBlobTier,
 	}
+
+	return *jptm.transferInfo
 }
 
 func (jptm *jobPartTransferMgr) Context() context.Context {
@@ -323,7 +400,7 @@ func (jptm *jobPartTransferMgr) WaitUntilLockDestination(ctx context.Context) er
 	return err
 }
 
-func (jptm *jobPartTransferMgr) UnlockDestination() {
+func (jptm *jobPartTransferMgr) EnsureDestinationUnlocked() {
 	didHaveLock := atomic.CompareAndSwapUint32(&jptm.atomicDestLockHeldIndicator, 1, 0) // set to 0, but only if it is currently 1. Return true if changed
 	// only unlock if THIS jptm actually had the lock. (So that we don't make unwanted removals from fileCountLimiter)
 	if didHaveLock {
@@ -351,16 +428,8 @@ func (jptm *jobPartTransferMgr) ScheduleChunks(chunkFunc chunkFunc) {
 	jptm.jobPartMgr.ScheduleChunks(chunkFunc)
 }
 
-func (jptm *jobPartTransferMgr) BlobDstData(dataFileToXfer []byte) (headers azblob.BlobHTTPHeaders, metadata azblob.Metadata) {
-	return jptm.jobPartMgr.(*jobPartMgr).blobDstData(jptm.Info().Source, dataFileToXfer)
-}
-
-func (jptm *jobPartTransferMgr) FileDstData(dataFileToXfer []byte) (headers azfile.FileHTTPHeaders, metadata azfile.Metadata) {
-	return jptm.jobPartMgr.(*jobPartMgr).fileDstData(jptm.Info().Source, dataFileToXfer)
-}
-
-func (jptm *jobPartTransferMgr) BfsDstData(dataFileToXfer []byte) (headers azbfs.BlobFSHTTPHeaders) {
-	return jptm.jobPartMgr.(*jobPartMgr).bfsDstData(jptm.Info().Source, dataFileToXfer)
+func (jptm *jobPartTransferMgr) ResourceDstData(dataFileToXfer []byte) (headers common.ResourceHTTPHeaders, metadata common.Metadata) {
+	return jptm.jobPartMgr.(*jobPartMgr).resourceDstData(jptm.Info().Source, dataFileToXfer)
 }
 
 // TODO refactor into something like jptm.IsLastModifiedTimeEqual() so that there is NO LastModifiedTime method and people therefore CAN'T do it wrong due to time zone
@@ -401,7 +470,7 @@ func (jptm *jobPartTransferMgr) BlobTiers() (blockBlobTier common.BlockBlobTier,
 // JobHasLowFileCount returns an estimate of whether we only have a very small number of files in the overall job
 // (An "estimate" because it actually only looks at the current job part)
 func (jptm *jobPartTransferMgr) JobHasLowFileCount() bool {
-	// TODO: review this guestimated threshold
+	// TODO: review this guesstimated threshold
 	// Threshold is chosen because for a single large file (in Windows-based test configuration with approx 9.5 Gps disks)
 	// one file gets between 2 or 5 Gbps (depending on other factors), but we really want at least 4 times that throughput.
 	// So a minimal threshold would be 4.
@@ -509,6 +578,7 @@ func (jptm *jobPartTransferMgr) hasStartedWork() bool {
 // the raw status values do not reflect possible cancellation.
 // Do not call directly. Use IsDeadBeforeStart or IsDeadInflight
 // instead because they usually require different handling
+// Practically, a jptm is dead as soon as the context is released.
 func (jptm *jobPartTransferMgr) isDead() bool {
 	return jptm.TransferStatusIgnoringCancellation() < 0 || jptm.WasCanceled()
 }
@@ -579,7 +649,7 @@ func (jptm *jobPartTransferMgr) FailActiveS2SCopyWithStatus(where string, err er
 	jptm.failActiveTransfer(transferErrorCodeCopyFailed, where, err, failureStatus)
 }
 
-// TODO: FailActive* need be further refactored with a seperate workitem.
+// TODO: FailActive* need be further refactored with a separate workitem.
 func (jptm *jobPartTransferMgr) TempJudgeUploadOrCopy() (isUpload, isCopy bool) {
 	fromTo := jptm.FromTo()
 
@@ -597,7 +667,10 @@ func (jptm *jobPartTransferMgr) FailActiveSend(where string, err error) {
 	} else if isCopy {
 		jptm.FailActiveS2SCopy(where, err)
 	} else {
-		panic("invalid state, FailActiveSend used by illegal direction")
+		// we used to panic here, but that was hard to maintain, e.g. if there was a failure path that wasn't exercised
+		// by test suite, and it reached this point in the code, we'd get a panic, but really it's better to just fail the
+		// transfer
+		jptm.FailActiveDownload(where+" (check operation type, is it really download?)", err)
 	}
 }
 
@@ -694,16 +767,18 @@ const (
 
 func (jptm *jobPartTransferMgr) LogAtLevelForCurrentTransfer(level pipeline.LogLevel, msg string) {
 	// order of log elements here is mirrored, with some more added, in logTransferError
-	fullMsg := common.URLStringExtension(jptm.Info().Source).RedactSecretQueryParamForLogging() + " " +
+	info := jptm.Info()
+	fullMsg := common.URLStringExtension(info.Source).RedactSecretQueryParamForLogging() + " " + info.entityTypeLogIndicator() +
 		msg +
-		" Dst: " + common.URLStringExtension(jptm.Info().Destination).RedactSecretQueryParamForLogging()
+		" Dst: " + common.URLStringExtension(info.Destination).RedactSecretQueryParamForLogging()
 
 	jptm.Log(level, fullMsg)
 }
 
 func (jptm *jobPartTransferMgr) logTransferError(errorCode transferErrorCode, source, destination, errorMsg string, status int) {
 	// order of log elements here is mirrored, in subset, in LogForCurrentTransfer
-	msg := fmt.Sprintf("%v: ", errorCode) + common.URLStringExtension(source).RedactSecretQueryParamForLogging() +
+	info := jptm.Info() // TODO we are getting a lot of Info calls and its (presumably) not well-optimized.  Profile that?
+	msg := fmt.Sprintf("%v: %v", errorCode, info.entityTypeLogIndicator()) + common.URLStringExtension(source).RedactSecretQueryParamForLogging() +
 		fmt.Sprintf(" : %03d : %s\n   Dst: ", status, errorMsg) + common.URLStringExtension(destination).RedactSecretQueryParamForLogging()
 	jptm.Log(pipeline.LogError, msg)
 }
@@ -720,7 +795,7 @@ func (jptm *jobPartTransferMgr) LogS2SCopyError(source, destination, errorMsg st
 	jptm.logTransferError(transferErrorCodeCopyFailed, source, destination, errorMsg, status)
 }
 
-// TODO: Log*Error need be further refactored with a seperate workitem.
+// TODO: Log*Error need be further refactored with a separate workitem.
 func (jptm *jobPartTransferMgr) LogSendError(source, destination, errorMsg string, status int) {
 	isUpload, isCopy := jptm.TempJudgeUploadOrCopy()
 
@@ -775,9 +850,22 @@ func (jptm *jobPartTransferMgr) ReportTransferDone() uint32 {
 		panic("cannot report the same transfer done twice")
 	}
 
-	return jptm.jobPartMgr.ReportTransferDone()
+	return jptm.jobPartMgr.ReportTransferDone(jptm.jobPartPlanTransfer.TransferStatus())
 }
 
 func (jptm *jobPartTransferMgr) SourceProviderPipeline() pipeline.Pipeline {
 	return jptm.jobPartMgr.SourceProviderPipeline()
+}
+
+func (jptm *jobPartTransferMgr) SecurityInfoPersistenceManager() *securityInfoPersistenceManager {
+	return jptm.jobPartMgr.SecurityInfoPersistenceManager()
+}
+
+func (jptm *jobPartTransferMgr) FolderDeletionManager() common.FolderDeletionManager {
+	return jptm.jobPartMgr.FolderDeletionManager()
+}
+
+func (jptm *jobPartTransferMgr) GetDestinationRoot() string {
+	p := jptm.jobPartMgr.Plan()
+	return string(p.DestinationRoot[:p.DestinationRootLength])
 }

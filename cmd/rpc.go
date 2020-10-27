@@ -43,8 +43,11 @@ func inprocSend(rpcCmd common.RpcCmd, requestData interface{}, responseData inte
 	case common.ERpcCmd.CopyJobPartOrder():
 		*(responseData.(*common.CopyJobPartOrderResponse)) = ste.ExecuteNewCopyJobPartOrder(*requestData.(*common.CopyJobPartOrderRequest))
 
+	case common.ERpcCmd.GetJobLCMWrapper():
+		*(responseData.(*common.LifecycleMgr)) = ste.GetJobLCMWrapper(*requestData.(*common.JobID))
+
 	case common.ERpcCmd.ListJobs():
-		*(responseData.(*common.ListJobsResponse)) = ste.ListJobs()
+		*(responseData.(*common.ListJobsResponse)) = ste.ListJobs(requestData.(common.JobStatus))
 
 	case common.ERpcCmd.ListJobSummary():
 		*(responseData.(*common.ListJobSummaryResponse)) = ste.GetJobSummary(*requestData.(*common.JobID))
@@ -104,7 +107,7 @@ func (httpClient *HTTPClient) send(rpcCmd common.RpcCmd, requestData interface{}
 		return err
 	}
 
-	// Read response data, deserialie it and return it (via out responseData parameter) & error
+	// Read response data, deserialize it and return it (via out responseData parameter) & error
 	responseJson, err := ioutil.ReadAll(response.Body)
 	response.Body.Close()
 	if err != nil {

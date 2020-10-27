@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Azure/azure-storage-azcopy/common"
 	"io/ioutil"
 	"math/rand"
 	"net/url"
@@ -319,6 +320,18 @@ func createNewBlockBlob(c *chk.C, container azblob.ContainerURL, prefix string) 
 	return
 }
 
+func createNewDirectoryStub(c *chk.C, container azblob.ContainerURL, dirPath string) {
+	dir := container.NewBlockBlobURL(dirPath)
+
+	cResp, err := dir.Upload(ctx, bytes.NewReader(nil), azblob.BlobHTTPHeaders{},
+		azblob.Metadata{"hdi_isfolder": "true"}, azblob.BlobAccessConditions{})
+
+	c.Assert(err, chk.IsNil)
+	c.Assert(cResp.StatusCode(), chk.Equals, 201)
+
+	return
+}
+
 func createNewAzureShare(c *chk.C, fsu azfile.ServiceURL) (share azfile.ShareURL, name string) {
 	share, name = getShareURL(c, fsu)
 
@@ -344,7 +357,8 @@ func createNewAzureFile(c *chk.C, share azfile.ShareURL, prefix string) (file az
 func generateParentsForAzureFile(c *chk.C, fileURL azfile.FileURL) {
 	accountName, accountKey := getAccountAndKey()
 	credential, _ := azfile.NewSharedKeyCredential(accountName, accountKey)
-	err := ste.AzureFileParentDirCreator{}.CreateParentDirToRoot(ctx, fileURL, azfile.NewPipeline(credential, azfile.PipelineOptions{}))
+	t := common.NewFolderCreationTracker(common.EFolderPropertiesOption.NoFolders())
+	err := ste.AzureFileParentDirCreator{}.CreateParentDirToRoot(ctx, fileURL, azfile.NewPipeline(credential, azfile.PipelineOptions{}), t)
 	c.Assert(err, chk.IsNil)
 }
 
